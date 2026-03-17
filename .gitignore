@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+
+# Environment config (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Whisper model cache
+*.bin
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
