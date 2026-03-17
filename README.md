@@ -87,6 +87,86 @@ The bridge connects to Antigravity's Electron window via the [Chrome DevTools Pr
 
 Voice messages are transcribed locally using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no cloud API needed).
 
+## 🔄 Auto-Restart with Systemd (Recommended)
+
+Without systemd, the Antigravity CDP instance and the bridge will stop if the system reboots, the process crashes, or the terminal closes. Setting up systemd user services ensures **everything auto-starts and auto-restarts**.
+
+### Install the Services
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+# Service 1: Keep Antigravity CDP instance alive
+cat > ~/.config/systemd/user/antigravity-cdp.service << 'EOF'
+[Unit]
+Description=Antigravity IDE with CDP (for Telegram Bridge)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/antigravity/antigravity --user-data-dir=%h/.config/Antigravity-CDP --remote-debugging-port=9222
+Restart=always
+RestartSec=10
+# Adjust these to match your display environment (run `echo $DISPLAY` to check)
+Environment=DISPLAY=:1
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Service 2: Keep the Telegram Bridge alive
+cat > ~/.config/systemd/user/telegram-bridge.service << 'EOF'
+[Unit]
+Description=Antigravity Telegram Bridge
+After=antigravity-cdp.service
+Wants=antigravity-cdp.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/work/telegram-bridge
+ExecStartPre=/bin/sleep 15
+ExecStart=%h/work/telegram-bridge/venv/bin/python3 %h/work/telegram-bridge/bridge.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+```
+
+> **Note**: Adjust the `DISPLAY` and `WAYLAND_DISPLAY` values if your setup differs. Run `echo $DISPLAY` in a terminal to check.
+
+### Enable and Start
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable antigravity-cdp.service telegram-bridge.service
+systemctl --user start antigravity-cdp.service telegram-bridge.service
+
+# Optional: allow services to run even after logout
+sudo loginctl enable-linger $USER
+```
+
+### Management Commands
+
+```bash
+# Check status
+systemctl --user status telegram-bridge
+systemctl --user status antigravity-cdp
+
+# View live logs
+journalctl --user -u telegram-bridge -f
+
+# Restart
+systemctl --user restart telegram-bridge
+
+# Stop everything
+systemctl --user stop telegram-bridge antigravity-cdp
+```
+
 ## 📋 Requirements
 
 - Python 3.10+
@@ -103,7 +183,7 @@ Contributions welcome! Some ideas:
 - [ ] Inline keyboard for model/mode selection
 - [ ] Auto-approval of tool calls
 - [ ] File attachment support
-- [ ] Systemd service for auto-start
+- [x] ~~Systemd service for auto-start~~
 
 ## 📄 License
 
