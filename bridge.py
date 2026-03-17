@@ -190,12 +190,31 @@ class CdpConnection:
         except Exception:
             return self.ws is not None
 
+    async def ensure_connected(self) -> bool:
+        """Auto-reconnect if WebSocket is dead."""
+        if self.connected:
+            return True
+        log.info("CDP connection lost, attempting to reconnect...")
+        await self.close()
+        for attempt in range(3):
+            ok = await self.discover_and_connect()
+            if ok:
+                log.info("✅ CDP reconnected!")
+                return True
+            log.warning(f"Reconnect attempt {attempt + 1}/3 failed, retrying in 5s...")
+            await asyncio.sleep(5)
+        log.error("❌ Failed to reconnect after 3 attempts")
+        return False
+
     async def close(self):
         if self._recv_task:
             self._recv_task.cancel()
             self._recv_task = None
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
             self.ws = None
         self.contexts.clear()
 
@@ -370,6 +389,9 @@ class AntigravityBridge:
     async def send_and_receive(self, text: str, progress_callback=None) -> str:
         """Full cycle: inject message → wait for response → return text."""
         async with self._lock:
+            # Auto-reconnect if CDP connection dropped
+            if not await self.cdp.ensure_connected():
+                return "❌ Cannot connect to Antigravity (CDP not available)"
             if not await self.inject_message(text):
                 return "❌ Failed to inject message into Antigravity"
             return await self.wait_for_response(progress_callback)
