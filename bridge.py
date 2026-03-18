@@ -528,9 +528,9 @@ whisper_model: Optional[WhisperModel] = None
 def get_whisper_model() -> WhisperModel:
     global whisper_model
     if whisper_model is None:
-        log.info("Loading faster-whisper model (base) on CPU...")
-        # Using "base" model on CPU with int8 for speed
-        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        log.info("Loading faster-whisper model (small) on GPU...")
+        # Using "small" model on GPU with float16 for better accuracy & speed
+        whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
         log.info("Local Whisper model loaded successfully.")
     return whisper_model
 
