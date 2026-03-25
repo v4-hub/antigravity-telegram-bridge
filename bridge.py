@@ -20,18 +20,21 @@ import logging
 import signal
 import html
 import tempfile
+import subprocess
 import urllib.request
+import atexit
 from typing import Optional
 
 import websockets
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 try:
-    from faster_whisper import WhisperModel
-    WHISPER_AVAILABLE = True
+    from funasr import AutoModel
+    FUNASR_AVAILABLE = True
 except ImportError:
-    WHISPER_AVAILABLE = False
+    FUNASR_AVAILABLE = False
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes
 )
 
 # Load .env file if python-dotenv is available
@@ -58,6 +61,8 @@ POLL_INTERVAL = 2.0        # seconds between DOM polls
 STABLE_ROUNDS = 3          # how many unchanged polls before we declare "complete"
 MAX_WAIT = 600             # max seconds to wait for a response
 MAX_MSG_LEN = 4096         # Telegram message length limit
+PID_LOCK_FILE = "/tmp/telegram-bridge.pid"  # singleton guard
+CONTEXT_CACHE_SIZE = 5     # number of recent exchanges to cache for restart recovery
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +70,52 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bridge")
+
+
+# ── PID Lock (Singleton Guard) ────────────────────────────────────────────────
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return False
+
+
+def acquire_pid_lock():
+    """Acquire PID lock file. Exit if another instance is already running."""
+    if os.path.exists(PID_LOCK_FILE):
+        try:
+            with open(PID_LOCK_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            if _is_pid_alive(old_pid) and old_pid != os.getpid():
+                print(f"❌ Another bridge instance is already running (PID {old_pid}). Exiting.")
+                sys.exit(1)
+            else:
+                log.info(f"Stale PID lock found (PID {old_pid} is dead). Taking over.")
+        except (ValueError, FileNotFoundError):
+            pass  # corrupt or removed between check and read
+
+    with open(PID_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(release_pid_lock)
+    log.info(f"PID lock acquired: {os.getpid()}")
+
+
+def release_pid_lock():
+    """Release PID lock file on exit."""
+    try:
+        if os.path.exists(PID_LOCK_FILE):
+            with open(PID_LOCK_FILE, "r") as f:
+                stored_pid = int(f.read().strip())
+            if stored_pid == os.getpid():
+                os.remove(PID_LOCK_FILE)
+                log.info("PID lock released.")
+    except Exception:
+        pass
 
 # ── CDP Helper ────────────────────────────────────────────────────────────────
 
@@ -217,6 +268,55 @@ class CdpConnection:
                 pass
             self.ws = None
         self.contexts.clear()
+
+
+# ── Conversation Cache (for restart context recovery) ─────────────────────────
+
+class ConversationCache:
+    """Ring buffer that caches recent user↔AI exchanges for context restoration."""
+
+    def __init__(self, max_size: int = CONTEXT_CACHE_SIZE):
+        self.max_size = max_size
+        self._exchanges: list[dict] = []  # [{"user": ..., "ai_summary": ...}, ...]
+
+    def record(self, user_msg: str, ai_response: str):
+        """Record a user→AI exchange. AI response is truncated to a summary."""
+        # Keep only first 200 chars of AI response as summary
+        summary = ai_response[:200].strip()
+        if len(ai_response) > 200:
+            summary += "..."
+        self._exchanges.append({"user": user_msg[:200], "ai_summary": summary})
+        if len(self._exchanges) > self.max_size:
+            self._exchanges = self._exchanges[-self.max_size:]
+
+    def build_resume_prompt(self) -> str:
+        """Build a context-restoration prompt from cached exchanges."""
+        if not self._exchanges:
+            return ""
+        lines = []
+        for ex in self._exchanges:
+            lines.append(f"User: {ex['user']}")
+            lines.append(f"AI: {ex['ai_summary']}")
+        history = "\n".join(lines)
+        return (
+            f"[CONTEXT RECOVERY] This is a new session after a remote restart. "
+            f"Below is a summary of the recent conversation before restart:\n\n"
+            f"{history}\n\n"
+            f"Please acknowledge you have this context and continue assisting. "
+            f"Do NOT repeat the previous answers — just confirm you're caught up "
+            f"in one short sentence."
+        )
+
+    def clear(self):
+        self._exchanges.clear()
+
+    @property
+    def has_context(self) -> bool:
+        return len(self._exchanges) > 0
+
+
+# Module-level singleton — survives across bridge reconnections
+conversation_cache = ConversationCache()
 
 
 # ── Antigravity Interaction ───────────────────────────────────────────────────
@@ -397,10 +497,349 @@ class AntigravityBridge:
             return await self.wait_for_response(progress_callback)
 
 
+# ── Approval Detection (ported from Remoat approvalDetector.ts) ───────────────
+
+DETECT_APPROVAL_SCRIPT = r"""
+(() => {
+    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time'];
+    const ALWAYS_ALLOW_PATTERNS = [
+        'allow this conversation', 'allow this chat', 'always allow',
+    ];
+    const ALLOW_PATTERNS = ['allow', 'permit'];
+    const DENY_PATTERNS = ['deny', 'decline'];
+
+    const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+    const allButtons = Array.from(document.querySelectorAll('button'))
+        .filter(btn => btn.offsetParent !== null);
+
+    let approveBtn = allButtons.find(btn => {
+        const t = normalize(btn.textContent || '');
+        return ALLOW_ONCE_PATTERNS.some(p => t.includes(p));
+    }) || null;
+
+    if (!approveBtn) {
+        approveBtn = allButtons.find(btn => {
+            const t = normalize(btn.textContent || '');
+            const isAlways = ALWAYS_ALLOW_PATTERNS.some(p => t.includes(p));
+            return !isAlways && ALLOW_PATTERNS.some(p => t.includes(p));
+        }) || null;
+    }
+
+    if (!approveBtn) return null;
+
+    const container = approveBtn.closest('[role="dialog"], .modal, .dialog, .approval-container, .permission-dialog')
+        || approveBtn.parentElement?.parentElement
+        || approveBtn.parentElement
+        || document.body;
+
+    const containerButtons = Array.from(container.querySelectorAll('button'))
+        .filter(btn => btn.offsetParent !== null);
+
+    const denyBtn = containerButtons.find(btn => {
+        const t = normalize(btn.textContent || '');
+        return DENY_PATTERNS.some(p => t.includes(p));
+    }) || null;
+
+    if (!denyBtn) return null;
+
+    const alwaysAllowBtn = containerButtons.find(btn => {
+        const t = normalize(btn.textContent || '');
+        return ALWAYS_ALLOW_PATTERNS.some(p => t.includes(p));
+    }) || null;
+
+    const approveText = (approveBtn.textContent || '').trim();
+    const alwaysAllowText = alwaysAllowBtn ? (alwaysAllowBtn.textContent || '').trim() : '';
+    const denyText = (denyBtn.textContent || '').trim();
+
+    let description = '';
+    const dialog = container;
+    if (dialog) {
+        const descEl = dialog.querySelector('p, .description, [data-testid="description"]');
+        if (descEl) {
+            description = (descEl.textContent || '').trim();
+        }
+    }
+    if (!description) {
+        const parent = approveBtn.parentElement?.parentElement || approveBtn.parentElement;
+        if (parent) {
+            const clone = parent.cloneNode(true);
+            const buttons = clone.querySelectorAll('button');
+            buttons.forEach(b => b.remove());
+            const parentText = (clone.textContent || '').trim();
+            if (parentText.length > 5 && parentText.length < 500) {
+                description = parentText;
+            }
+        }
+    }
+
+    return { approveText, alwaysAllowText, denyText, description };
+})()
+"""
+
+EXPAND_ALWAYS_ALLOW_SCRIPT = r"""
+(() => {
+    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time'];
+    const ALWAYS_ALLOW_PATTERNS = [
+        'allow this conversation', 'allow this chat', 'always allow',
+    ];
+    const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const visibleButtons = Array.from(document.querySelectorAll('button'))
+        .filter(btn => btn.offsetParent !== null);
+
+    const directAlways = visibleButtons.find(btn => {
+        const t = normalize(btn.textContent || '');
+        return ALWAYS_ALLOW_PATTERNS.some(p => t.includes(p));
+    });
+    if (directAlways) return { ok: true, reason: 'already-visible' };
+
+    const allowOnceBtn = visibleButtons.find(btn => {
+        const t = normalize(btn.textContent || '');
+        return ALLOW_ONCE_PATTERNS.some(p => t.includes(p));
+    });
+    if (!allowOnceBtn) return { ok: false, error: 'allow-once button not found' };
+
+    const container = allowOnceBtn.closest('[role="dialog"], .modal, .dialog, .approval-container, .permission-dialog')
+        || allowOnceBtn.parentElement?.parentElement
+        || allowOnceBtn.parentElement
+        || document.body;
+
+    const containerButtons = Array.from(container.querySelectorAll('button'))
+        .filter(btn => btn.offsetParent !== null);
+
+    const toggleBtn = containerButtons.find(btn => {
+        if (btn === allowOnceBtn) return false;
+        const text = normalize(btn.textContent || '');
+        const aria = normalize(btn.getAttribute('aria-label') || '');
+        const hasPopup = btn.getAttribute('aria-haspopup');
+        if (hasPopup === 'menu' || hasPopup === 'listbox') return true;
+        if (text === '') return true;
+        return /menu|more|expand|options|dropdown|chevron|arrow/.test(aria);
+    });
+
+    if (toggleBtn) {
+        toggleBtn.click();
+        return { ok: true, reason: 'toggle-button' };
+    }
+    return { ok: false, error: 'no toggle found' };
+})()
+"""
+
+def build_click_script(button_text: str) -> str:
+    """Generate JS that clicks a button by its text content."""
+    safe_text = json.dumps(button_text)
+    return f"""(() => {{
+        const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        const wanted = normalize({safe_text});
+        const allButtons = Array.from(document.querySelectorAll('button'));
+        const target = allButtons.find(btn => {{
+            if (!btn.offsetParent) return false;
+            const buttonText = normalize(btn.textContent || '');
+            const ariaLabel = normalize(btn.getAttribute('aria-label') || '');
+            return buttonText === wanted || ariaLabel === wanted ||
+                buttonText.includes(wanted) || ariaLabel.includes(wanted);
+        }});
+        if (!target) return {{ ok: false, error: 'Button not found: ' + {safe_text} }};
+        target.click();
+        return {{ ok: true }};
+    }})()"""
+
+
+class ApprovalMonitor:
+    """Background poller that detects approval dialogs and notifies via Telegram."""
+
+    POLL_INTERVAL = 1.5  # seconds
+
+    def __init__(self, cdp_conn: CdpConnection, bot_app, chat_id: int):
+        self.cdp = cdp_conn
+        self.bot_app = bot_app
+        self.chat_id = chat_id
+        self._task: Optional[asyncio.Task] = None
+        self._last_key: Optional[str] = None
+        self._last_info: Optional[dict] = None
+        self._msg_id: Optional[int] = None  # Telegram message with buttons
+        self.auto_accept = False
+
+    def start(self):
+        if self._task and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._poll_loop())
+        log.info("ApprovalMonitor started")
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        log.info("ApprovalMonitor stopped")
+
+    async def _poll_loop(self):
+        while True:
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if "WebSocket" not in str(e):
+                    log.debug(f"ApprovalMonitor poll error: {e}")
+            await asyncio.sleep(self.POLL_INTERVAL)
+
+    async def _poll_once(self):
+        if not self.cdp.connected:
+            return
+
+        ctx_id = None
+        for ctx in self.cdp.contexts:
+            if "cascade-panel" in ctx.get("url", ""):
+                ctx_id = ctx["id"]
+                break
+
+        params = {"expression": DETECT_APPROVAL_SCRIPT, "returnByValue": True, "awaitPromise": False}
+        if ctx_id is not None:
+            params["contextId"] = ctx_id
+
+        try:
+            result = await self.cdp.call("Runtime.evaluate", params, timeout=5)
+        except Exception:
+            return
+
+        info = None
+        if result and "result" in result:
+            val = result["result"].get("value")
+            if isinstance(val, dict) and "approveText" in val:
+                info = val
+
+        if info:
+            key = f"{info.get('approveText', '')}::{info.get('description', '')}"
+            if key != self._last_key:
+                self._last_key = key
+                self._last_info = info
+
+                if self.auto_accept:
+                    # Auto-accept mode: click allow immediately
+                    await self._click_button(info.get("approveText", "Allow"), ctx_id)
+                    log.info(f"Auto-accepted: {info.get('description', '?')}")
+                    try:
+                        await self.bot_app.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=f"⚡ Auto-allowed: {info.get('description', '(action)')}",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await self._send_approval_buttons(info)
+        else:
+            if self._last_key is not None:
+                self._last_key = None
+                self._last_info = None
+                # Clean up old button message
+                if self._msg_id:
+                    try:
+                        await self.bot_app.bot.edit_message_text(
+                            chat_id=self.chat_id,
+                            message_id=self._msg_id,
+                            text="✅ Approval resolved.",
+                        )
+                    except Exception:
+                        pass
+                    self._msg_id = None
+
+    async def _send_approval_buttons(self, info: dict):
+        desc = info.get("description", "(unknown action)")
+        approve_text = info.get("approveText", "Allow")
+        deny_text = info.get("denyText", "Deny")
+
+        text = f"🔐 *Approval Required*\n\n{desc}"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"✅ {approve_text}", callback_data="approval_allow"),
+                InlineKeyboardButton("✅ Allow All", callback_data="approval_always"),
+            ],
+            [
+                InlineKeyboardButton(f"❌ {deny_text}", callback_data="approval_deny"),
+            ],
+        ])
+
+        try:
+            msg = await self.bot_app.bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            self._msg_id = msg.message_id
+            log.info(f"Sent approval request: {desc}")
+        except Exception as e:
+            log.error(f"Failed to send approval message: {e}")
+
+    async def _click_button(self, button_text: str, ctx_id: int = None) -> bool:
+        script = build_click_script(button_text)
+        params = {"expression": script, "returnByValue": True, "awaitPromise": False}
+        if ctx_id is not None:
+            params["contextId"] = ctx_id
+        try:
+            result = await self.cdp.call("Runtime.evaluate", params, timeout=5)
+            val = result.get("result", {}).get("value", {})
+            return val.get("ok", False) if isinstance(val, dict) else False
+        except Exception as e:
+            log.error(f"Click button error: {e}")
+            return False
+
+    async def handle_callback(self, action: str) -> str:
+        """Handle a Telegram inline button callback. Returns status message."""
+        info = self._last_info
+        if not info:
+            return "⚠️ No pending approval found."
+
+        ctx_id = None
+        for ctx in self.cdp.contexts:
+            if "cascade-panel" in ctx.get("url", ""):
+                ctx_id = ctx["id"]
+                break
+
+        if action == "approval_allow":
+            ok = await self._click_button(info.get("approveText", "Allow"), ctx_id)
+            return "✅ Allowed!" if ok else "❌ Failed to click Allow button."
+
+        elif action == "approval_always":
+            # Try to expand dropdown and click "Allow This Conversation"
+            expand_params = {"expression": EXPAND_ALWAYS_ALLOW_SCRIPT, "returnByValue": True, "awaitPromise": False}
+            if ctx_id is not None:
+                expand_params["contextId"] = ctx_id
+            try:
+                await self.cdp.call("Runtime.evaluate", expand_params, timeout=5)
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+            candidates = [
+                info.get("alwaysAllowText", ""),
+                "Allow This Conversation", "Allow This Chat", "Always Allow",
+            ]
+            for candidate in candidates:
+                if candidate and await self._click_button(candidate, ctx_id):
+                    return "✅ Allowed for this conversation!"
+
+            # Fallback to regular allow
+            ok = await self._click_button(info.get("approveText", "Allow"), ctx_id)
+            return "✅ Allowed (fallback to single allow)!" if ok else "❌ Failed to click Allow button."
+
+        elif action == "approval_deny":
+            ok = await self._click_button(info.get("denyText", "Deny"), ctx_id)
+            return "❌ Denied!" if ok else "❌ Failed to click Deny button."
+
+        return "⚠️ Unknown action."
+
+
 # ── Telegram Bot ──────────────────────────────────────────────────────────────
 
 cdp = CdpConnection()
 bridge: Optional[AntigravityBridge] = None
+approval_monitor: Optional[ApprovalMonitor] = None
 
 
 def authorized(user_id: int) -> bool:
@@ -415,7 +854,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send me any message and I'll forward it to Antigravity.\n\n"
         "Commands:\n"
         "/status — Check CDP connection\n"
-        "/reconnect — Reconnect to Antigravity\n",
+        "/reconnect — Reconnect to Antigravity\n"
+        "/restart — Save work \u0026 restart Antigravity\n"
+        "/memstat — Check Antigravity memory usage\n"
+        "/autoaccept — Toggle auto-accept mode\n",
         parse_mode="Markdown",
     )
 
@@ -443,6 +885,312 @@ async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Reconnected to Antigravity!")
     else:
         await update.message.reply_text("❌ Failed to connect. Is Antigravity running with --remote-debugging-port=9222?")
+
+
+AG_SERVICE_NAME = "antigravity-cdp.service"
+AG_RESTART_TIMEOUT = 60  # seconds to wait for systemd restart cycle
+_restart_in_progress = False  # debounce flag for /restart
+
+
+def _get_antigravity_main_pid() -> Optional[int]:
+    """Find the main Antigravity process PID via systemd."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "--property=MainPID", AG_SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Output format: MainPID=12345
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("MainPID="):
+                pid = int(line.split("=", 1)[1])
+                return pid if pid > 0 else None
+    except Exception:
+        pass
+    # Fallback to pgrep
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "antigravity.*--user-data-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split("\n")
+        return int(pids[0]) if pids and pids[0] else None
+    except Exception:
+        return None
+
+
+def _get_service_active_state() -> str:
+    """Get the ActiveState of the antigravity-cdp systemd service."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "--property=ActiveState", AG_SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("ActiveState="):
+                return line.split("=", 1)[1]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _kill_orphaned_antigravity_in_bridge_cgroup():
+    """Kill any Antigravity processes that ended up in the bridge's cgroup from previous bad restarts."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "antigravity.*--user-data-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if not result.stdout.strip():
+            return 0
+        killed = 0
+        for pid_str in result.stdout.strip().split("\n"):
+            pid = int(pid_str)
+            # Check if this process is in the telegram-bridge cgroup (orphan from previous restart)
+            try:
+                cgroup_path = f"/proc/{pid}/cgroup"
+                with open(cgroup_path, "r") as f:
+                    cgroup_content = f.read()
+                if "telegram-bridge" in cgroup_content:
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+                    log.info(f"Killed orphaned Antigravity process {pid} in bridge cgroup")
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return killed
+    except Exception as e:
+        log.warning(f"Error cleaning orphan processes: {e}")
+        return 0
+
+
+def _get_antigravity_rss_mb() -> int:
+    """Get total RSS of all Antigravity-related processes in MB."""
+    try:
+        main_pid = _get_antigravity_main_pid()
+        if not main_pid:
+            return 0
+        result = subprocess.run(
+            ["pstree", "-p", str(main_pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        import re
+        pids = re.findall(r'\((\d+)\)', result.stdout)
+        total_kb = 0
+        for pid in set(pids):
+            try:
+                rss_result = subprocess.run(
+                    ["ps", "-o", "rss=", "-p", pid],
+                    capture_output=True, text=True, timeout=3,
+                )
+                rss = rss_result.stdout.strip()
+                if rss:
+                    total_kb += int(rss)
+            except Exception:
+                continue
+        return total_kb // 1024
+    except Exception:
+        return 0
+
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gracefully restart Antigravity via systemd: systemctl restart → reconnect CDP."""
+    if not authorized(update.effective_user.id):
+        return
+
+    global bridge, approval_monitor, _restart_in_progress
+
+    # Debounce: prevent concurrent restart commands
+    if _restart_in_progress:
+        await update.message.reply_text(
+            "⚠️ A restart is already in progress. Please wait.",
+        )
+        return
+    _restart_in_progress = True
+
+    try:
+        await _do_restart(update)
+    finally:
+        _restart_in_progress = False
+
+
+async def _do_restart(update: Update):
+    """Internal restart implementation, called by cmd_restart with debounce guard."""
+    global bridge, approval_monitor
+    status_msg = await update.message.reply_text(
+        "🔄 *Restarting Antigravity...*\n\n1️⃣ Checking service...",
+        parse_mode="Markdown",
+    )
+
+    # 0. Clean up orphaned Antigravity processes from previous bad restarts
+    orphans_killed = _kill_orphaned_antigravity_in_bridge_cgroup()
+    if orphans_killed:
+        log.info(f"Cleaned {orphans_killed} orphaned Antigravity process(es) from bridge cgroup")
+
+    # 1. Check current state
+    old_pid = _get_antigravity_main_pid()
+    state = _get_service_active_state()
+
+    if state == "unknown":
+        await status_msg.edit_text(
+            "❌ `antigravity-cdp.service` not found.\n"
+            "Make sure it is installed as a user systemd service.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 2. Close CDP connection before restart
+    await cdp.close()
+    bridge = None
+
+    await status_msg.edit_text(
+        f"🔄 *Restarting Antigravity...*\n\n"
+        f"1️⃣ Service state: `{state}` (PID {old_pid or 'N/A'})\n"
+        f"2️⃣ Restarting via systemd (hot-exit → relaunch)...",
+        parse_mode="Markdown",
+    )
+
+    # 3. Delegate the full restart to systemd
+    #    systemd will: SIGTERM → wait → SIGKILL if needed → relaunch
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "restart", AG_SERVICE_NAME,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=AG_RESTART_TIMEOUT)
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip() or stdout.decode().strip()
+            await status_msg.edit_text(
+                f"❌ systemd restart failed (rc={proc.returncode}):\n`{err_msg}`",
+                parse_mode="Markdown",
+            )
+            return
+    except asyncio.TimeoutError:
+        await status_msg.edit_text(
+            f"⚠️ systemd restart timed out after {AG_RESTART_TIMEOUT}s.\n"
+            "Try `/reconnect` once Antigravity finishes loading.",
+            parse_mode="Markdown",
+        )
+        return
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed to restart service: `{e}`", parse_mode="Markdown")
+        return
+
+    await status_msg.edit_text(
+        "🔄 *Restarting Antigravity...*\n\n"
+        "1️⃣ Service restarted ✅\n"
+        "2️⃣ Work saved (hot-exit) ✅\n"
+        "3️⃣ Waiting for startup (reconnecting CDP)...",
+        parse_mode="Markdown",
+    )
+
+    # 4. Wait for CDP to become available
+    connected = False
+    for attempt in range(8):
+        await asyncio.sleep(5)
+        try:
+            ok = await cdp.discover_and_connect()
+            if ok:
+                bridge = AntigravityBridge(cdp)
+                connected = True
+                break
+        except Exception:
+            pass
+        log.info(f"CDP reconnect attempt {attempt + 1}/8...")
+
+    if connected:
+        new_pid = _get_antigravity_main_pid()
+        rss_mb = _get_antigravity_rss_mb()
+
+        # Restart approval monitor
+        if approval_monitor:
+            approval_monitor.cdp = cdp
+            approval_monitor.start()
+
+        # Inject context recovery prompt if we have cached conversation history
+        context_restored = False
+        if conversation_cache.has_context:
+            resume_prompt = conversation_cache.build_resume_prompt()
+            log.info(f"Injecting context recovery prompt ({len(resume_prompt)} chars)")
+            await status_msg.edit_text(
+                "✅ *Antigravity Restarted Successfully!*\n\n"
+                f"New PID: `{new_pid}`\n"
+                f"Memory: {rss_mb} MB\n"
+                f"CDP: 🟢 Connected\n"
+                f"🔄 Restoring conversation context...",
+                parse_mode="Markdown",
+            )
+            # Wait a bit for the UI to fully load before injecting
+            await asyncio.sleep(3)
+            try:
+                if await bridge.inject_message(resume_prompt):
+                    # Wait for AI acknowledgement (short timeout)
+                    ack = await bridge.wait_for_response()
+                    if ack:
+                        context_restored = True
+                        log.info("Context recovery acknowledged by AI")
+            except Exception as e:
+                log.warning(f"Context recovery injection failed: {e}")
+
+        restored_label = "Context restored ✅" if context_restored else "New session (no prior context)"
+        await status_msg.edit_text(
+            "✅ *Antigravity Restarted Successfully!*\n\n"
+            f"New PID: `{new_pid}`\n"
+            f"Memory: {rss_mb} MB\n"
+            f"CDP: 🟢 Connected\n"
+            f"Session: {restored_label}",
+            parse_mode="Markdown",
+        )
+    else:
+        await status_msg.edit_text(
+            "⚠️ *Antigravity relaunched but CDP not yet available*\n\n"
+            "Antigravity may still be loading. Try `/reconnect` in a moment.",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_memstat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current Antigravity memory usage."""
+    if not authorized(update.effective_user.id):
+        return
+
+    main_pid = _get_antigravity_main_pid()
+    if not main_pid:
+        await update.message.reply_text("⚠️ Antigravity is not running.")
+        return
+
+    rss_mb = _get_antigravity_rss_mb()
+
+    # Get top 5 memory consumers among Antigravity processes
+    try:
+        result = subprocess.run(
+            ["bash", "-c",
+             "ps aux --sort=-%mem | grep -i antigravity | grep -v grep | head -5 | "
+             "awk '{printf \"%s MB — %s\\n\", int($6/1024), $11}'"  
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        top_procs = result.stdout.strip()
+    except Exception:
+        top_procs = "(unable to list)"
+
+    # Warn level
+    if rss_mb >= 40960:
+        emoji = "🔴"
+        level = "CRITICAL"
+    elif rss_mb >= 20480:
+        emoji = "🟡"
+        level = "WARNING"
+    else:
+        emoji = "🟢"
+        level = "Healthy"
+
+    await update.message.reply_text(
+        f"{emoji} *Antigravity Memory: {level}*\n\n"
+        f"Total RSS: `{rss_mb} MB`\n"
+        f"Main PID: `{main_pid}`\n\n"
+        f"*Top processes:*\n```\n{top_procs}\n```",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,6 +1240,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await thinking_msg.edit_text(f"❌ Error: {e}")
         return
 
+    # Cache the exchange for context recovery after restart
+    if response and not response.startswith("❌"):
+        conversation_cache.record(user_text, response)
+
     if not response:
         await thinking_msg.edit_text("⚠️ No response received")
         return
@@ -521,18 +1273,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send chunk: {e}")
 
-# ── Speech to Text (Local Whisper) ────────────────────────────────────────────
+# ── Speech to Text (FunASR) ───────────────────────────────────────────────────
 
-whisper_model: Optional[WhisperModel] = None
+funasr_model = None
 
-def get_whisper_model() -> WhisperModel:
-    global whisper_model
-    if whisper_model is None:
-        log.info("Loading faster-whisper model (small) on GPU...")
-        # Using "small" model on GPU with float16 for better accuracy & speed
-        whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
-        log.info("Local Whisper model loaded successfully.")
-    return whisper_model
+def get_funasr_model():
+    global funasr_model
+    if funasr_model is None:
+        log.info("Loading FunASR Paraformer-large (paraformer-zh) model...")
+        funasr_model = AutoModel(
+            model="paraformer-zh", 
+            vad_model="fsmn-vad", 
+            punc_model="ct-punc-c", 
+            disable_update=True,
+            log_level="ERROR"
+        )
+        log.info("Local FunASR model loaded successfully.")
+    return funasr_model
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
@@ -552,14 +1309,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         await voice_file.download_to_drive(temp_path)
         
-        # 2. Transcribe with Local Whisper
-        await status_msg.edit_text("🗣️ Transcribing locally (faster-whisper)...")
+        # 2. Transcribe with FunASR
+        await status_msg.edit_text("🗣️ Transcribing locally (FunASR)...")
         
         def transcribe():
-            model = get_whisper_model()
-            segments, info = model.transcribe(temp_path, beam_size=5)
-            text = "".join([segment.text for segment in segments])
-            return text.strip()
+            model = get_funasr_model()
+            res = model.generate(input=temp_path)
+            if res and len(res) > 0 and 'text' in res[0]:
+                return res[0]['text'].strip()
+            return ""
 
         user_text = await asyncio.get_event_loop().run_in_executor(None, transcribe)
         
@@ -604,7 +1362,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         response = await bridge.send_and_receive(user_text, progress_cb)
-        
+
+        # Cache the exchange for context recovery after restart
+        if response and not response.startswith("❌"):
+            conversation_cache.record(user_text, response)
+
         if not response:
             await status_msg.edit_text("⚠️ No response received")
             return
@@ -640,9 +1402,54 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error processing voice message: {e}")
 
 
+async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button clicks for approval."""
+    query = update.callback_query
+    if not query or not authorized(query.from_user.id):
+        return
+    await query.answer()  # acknowledge the callback
+
+    action = query.data
+    if not action or not action.startswith("approval_"):
+        return
+
+    if not approval_monitor:
+        await query.edit_message_text("⚠️ Approval monitor not running.")
+        return
+
+    result_text = await approval_monitor.handle_callback(action)
+    try:
+        await query.edit_message_text(result_text)
+    except Exception:
+        pass
+
+
+async def cmd_autoaccept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto-accept mode: /autoaccept [on|off]"""
+    if not authorized(update.effective_user.id):
+        return
+    if not approval_monitor:
+        await update.message.reply_text("⚠️ Approval monitor not running.")
+        return
+
+    args = (context.args[0].lower() if context.args else "").strip()
+    if args in ("on", "enable", "true", "1"):
+        approval_monitor.auto_accept = True
+        await update.message.reply_text("✅ Auto-accept mode *ON*. All approvals will be auto-allowed.", parse_mode="Markdown")
+    elif args in ("off", "disable", "false", "0"):
+        approval_monitor.auto_accept = False
+        await update.message.reply_text("✅ Auto-accept mode *OFF*. Manual approval required.", parse_mode="Markdown")
+    else:
+        status = "ON 🟢" if approval_monitor.auto_accept else "OFF ⚪"
+        await update.message.reply_text(
+            f"⚙️ Auto-accept mode: *{status}*\n\nUsage: `/autoaccept on` or `/autoaccept off`",
+            parse_mode="Markdown",
+        )
+
+
 async def post_init(application):
     """Connect to CDP when the bot starts."""
-    global bridge
+    global bridge, approval_monitor
     log.info("Connecting to Antigravity via CDP...")
     ok = await cdp.discover_and_connect()
     if ok:
@@ -651,8 +1458,33 @@ async def post_init(application):
     else:
         log.warning("⚠️  CDP not connected yet. Will auto-connect on first message.")
 
+    # Register bot commands menu (keeps Telegram menu in sync with actual handlers)
+    from telegram import BotCommand
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Welcome message & help"),
+            BotCommand("status", "Check CDP connection status"),
+            BotCommand("reconnect", "Reconnect to Antigravity"),
+            BotCommand("restart", "Save work & restart Antigravity"),
+            BotCommand("memstat", "Check Antigravity memory usage"),
+            BotCommand("autoaccept", "Toggle auto-approve mode"),
+        ])
+        log.info("✅ Bot command menu registered")
+    except Exception as e:
+        log.warning(f"Failed to register bot commands: {e}")
+
+    # Start approval monitor (uses first allowed user as target chat)
+    if ALLOWED_USER_IDS:
+        target_chat_id = next(iter(ALLOWED_USER_IDS))
+        approval_monitor = ApprovalMonitor(cdp, application, target_chat_id)
+        approval_monitor.start()
+        log.info(f"✅ ApprovalMonitor started (chat_id={target_chat_id})")
+
 
 def main():
+    # Singleton guard: prevent multiple bridge instances
+    acquire_pid_lock()
+
     log.info("Starting Antigravity Telegram Bridge...")
     log.info(f"Allowed users: {ALLOWED_USER_IDS}")
 
@@ -662,6 +1494,10 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reconnect", cmd_reconnect))
+    app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("memstat", cmd_memstat))
+    app.add_handler(CommandHandler("autoaccept", cmd_autoaccept))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
