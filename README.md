@@ -61,7 +61,12 @@ To ensure the bridge and IDE are always connected, use the smart launcher:
 bash install_mac_service.sh
 ```
 
-**For Linux / Manual Start:**
+**For Linux (One-click):**
+```bash
+bash install_linux_service.sh
+```
+
+**Manual Start (No background service):**
 ```bash
 bash run_bridge.sh
 ```
@@ -102,66 +107,12 @@ The bridge connects to Antigravity's Electron window via the [Chrome DevTools Pr
 
 Voice messages are transcribed locally using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no cloud API needed).
 
-## 🔄 Auto-Restart with Systemd (Recommended)
+## 🔄 Auto-Restart with Systemd (Linux Only)
 
-Without systemd, the Antigravity CDP instance and the bridge will stop if the system reboots, the process crashes, or the terminal closes. Setting up systemd user services ensures **everything auto-starts and auto-restarts**.
+If you ran `bash install_linux_service.sh`, the background service is already set up! The smart launcher manages both the Bridge and the Antigravity IDE automatically.
 
-### Install the Services
-
+**Optional: allow the service to run even after you log out:**
 ```bash
-mkdir -p ~/.config/systemd/user
-
-# Service 1: Keep Antigravity CDP instance alive
-cat > ~/.config/systemd/user/antigravity-cdp.service << 'EOF'
-[Unit]
-Description=Antigravity IDE with CDP (for Telegram Bridge)
-After=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=/opt/antigravity/antigravity --user-data-dir=%h/.config/Antigravity-CDP --remote-debugging-port=9233
-Restart=always
-RestartSec=10
-# Adjust these to match your display environment (run `echo $DISPLAY` to check)
-Environment=DISPLAY=:1
-Environment=WAYLAND_DISPLAY=wayland-1
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
-
-[Install]
-WantedBy=default.target
-EOF
-
-# Service 2: Keep the Telegram Bridge alive
-cat > ~/.config/systemd/user/telegram-bridge.service << 'EOF'
-[Unit]
-Description=Antigravity Telegram Bridge
-After=antigravity-cdp.service
-Wants=antigravity-cdp.service
-
-[Service]
-Type=simple
-WorkingDirectory=%h/work/telegram-bridge
-ExecStartPre=/bin/sleep 15
-ExecStart=%h/work/telegram-bridge/venv/bin/python3 %h/work/telegram-bridge/bridge.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-```
-
-> **Note**: Adjust the `DISPLAY` and `WAYLAND_DISPLAY` values if your setup differs. Run `echo $DISPLAY` in a terminal to check.
-
-### Enable and Start
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable antigravity-cdp.service telegram-bridge.service
-systemctl --user start antigravity-cdp.service telegram-bridge.service
-
-# Optional: allow services to run even after logout
 sudo loginctl enable-linger $USER
 ```
 

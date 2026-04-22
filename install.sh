@@ -61,14 +61,22 @@ else
     echo "✅ .env file already exists"
 fi
 
+OS_TYPE=$(uname)
 echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║  ✅ Installation complete!                   ║"
 echo "║                                              ║"
 echo "║  Next steps:                                 ║"
 echo "║  1. Edit .env with your bot token & user ID  ║"
-echo "║  2. (macOS) Set up background service:       ║"
-echo "║     bash install_mac_service.sh              ║"
+
+if [ "$OS_TYPE" = "Darwin" ]; then
+    echo "║  2. (macOS) Set up background service:       ║"
+    echo "║     bash install_mac_service.sh              ║"
+else
+    echo "║  2. (Linux) Set up background service:       ║"
+    echo "║     bash install_linux_service.sh            ║"
+fi
+
 echo "║  3. Or run manually (auto-starts IDE):       ║"
 echo "║     bash run_bridge.sh                       ║"
 echo "╚══════════════════════════════════════════════╝"
