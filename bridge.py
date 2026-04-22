@@ -632,6 +632,8 @@ EXPAND_ALWAYS_ALLOW_SCRIPT = r"""
     const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time', '允许一次', '单次允许'];
     const ALWAYS_ALLOW_PATTERNS = [
         'allow this conversation', 'allow this chat', 'always allow', '在此对话中允许', '总是允许',
+        'allow for this workspace', 'always allow for this workspace', 'allow globally', 'always allow globally',
+        '在当前工作空间允许', '全局允许', '在当前工作区允许', '工作区允许', '始终允许全局'
     ];
     const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
     const visibleButtons = Array.from(document.querySelectorAll('button'))
@@ -807,9 +809,13 @@ class ApprovalMonitor:
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(f"✅ {approve_text}", callback_data="approval_allow"),
-                InlineKeyboardButton("✅ Allow All", callback_data="approval_always"),
             ],
             [
+                InlineKeyboardButton("🏠 Allow Workspace", callback_data="approval_workspace"),
+                InlineKeyboardButton("🌍 Allow Globally", callback_data="approval_global"),
+            ],
+            [
+                InlineKeyboardButton("✅ Allow Conversation", callback_data="approval_always"),
                 InlineKeyboardButton(f"❌ {deny_text}", callback_data="approval_deny"),
             ],
         ])
@@ -855,8 +861,8 @@ class ApprovalMonitor:
             ok = await self._click_button(info.get("approveText", "Allow"), ctx_id)
             return "✅ Allowed!" if ok else "❌ Failed to click Allow button."
 
-        elif action == "approval_always":
-            # Try to expand dropdown and click "Allow This Conversation"
+        elif action in ("approval_always", "approval_workspace", "approval_global"):
+            # Try to expand dropdown
             expand_params = {"expression": EXPAND_ALWAYS_ALLOW_SCRIPT, "returnByValue": True, "awaitPromise": False}
             if ctx_id is not None:
                 expand_params["contextId"] = ctx_id
@@ -866,14 +872,29 @@ class ApprovalMonitor:
             except Exception:
                 pass
 
-            candidates = [
-                info.get("alwaysAllowText", ""),
-                "Allow This Conversation", "Allow This Chat", "Always Allow",
-                "在此对话中允许", "总是允许",
-            ]
+            if action == "approval_workspace":
+                candidates = [
+                    "Allow for this workspace", "Always allow for this workspace",
+                    "在当前工作空间允许", "在当前工作区允许", "在工作区允许", "workspace"
+                ]
+                success_msg = "✅ Allowed for Workspace!"
+            elif action == "approval_global":
+                candidates = [
+                    "Allow globally", "Always allow globally",
+                    "全局允许", "始终允许全局", "globally"
+                ]
+                success_msg = "✅ Allowed Globally!"
+            else:
+                candidates = [
+                    info.get("alwaysAllowText", ""),
+                    "Allow This Conversation", "Allow This Chat", "Always Allow",
+                    "在此对话中允许", "总是允许"
+                ]
+                success_msg = "✅ Allowed for this conversation!"
+
             for candidate in candidates:
                 if candidate and await self._click_button(candidate, ctx_id):
-                    return "✅ Allowed for this conversation!"
+                    return success_msg
 
             # Fallback to regular allow
             ok = await self._click_button(info.get("approveText", "Allow"), ctx_id)
