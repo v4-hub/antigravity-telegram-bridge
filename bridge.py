@@ -68,6 +68,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
+    force=True,
 )
 log = logging.getLogger("bridge")
 
@@ -1468,7 +1469,183 @@ async def cmd_autoaccept(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚙️ Auto-accept mode: *{status}*\n\nUsage: `/autoaccept on` or `/autoaccept off`",
             parse_mode="Markdown",
         )
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View or switch the current LLM model: /model [name]"""
+    if not authorized(update.effective_user.id):
+        return
+        
+    args = " ".join(context.args).strip() if context.args else ""
+    
+    if not bridge or not bridge.cdp.connected:
+        await update.message.reply_text("❌ Not connected to Antigravity.")
+        return
 
+    ctx_id = await bridge._find_cascade_context()
+    
+    if not args:
+        # Click trigger to open dropdown
+        expr_trigger = r"""
+        (() => {
+            const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            const trigger = Array.from(document.querySelectorAll('*')).find(b => {
+                const aria = normalize(b.getAttribute('aria-label') || '');
+                return aria.startsWith('select model, current:');
+            });
+            if (trigger) { trigger.click(); return trigger.getAttribute('aria-label').replace(/select model, current:/i, '').trim(); }
+            return null;
+        })()
+        """
+        current_model = await bridge.cdp.evaluate(expr_trigger, ctx_id)
+        if not current_model:
+            await update.message.reply_text("❌ Could not find model selector.")
+            return
+            
+        await asyncio.sleep(0.5)
+        
+        # Get list of models
+        expr_list = r"""
+        (() => {
+            const items = Array.from(document.querySelectorAll('div, button')).filter(b => {
+                if (!b.offsetParent) return false;
+                const text = (b.textContent || '').trim();
+                if (text.includes('Credits:') || text.includes('%')) return false;
+                return (text.includes('Gemini') || text.includes('Claude') || text.includes('GPT')) && !b.getAttribute('aria-label');
+            });
+            return [...new Set(items.map(b => b.textContent.trim()).filter(t => t.length > 5 && t.length < 50))];
+        })()
+        """
+        models = await bridge.cdp.evaluate(expr_list, ctx_id)
+        
+        # Close dropdown
+        await bridge.cdp.evaluate("document.body.click()", ctx_id)
+        
+        if not models:
+            await update.message.reply_text(f"🤖 Current model: *{current_model}*\n\n(Could not list other models)", parse_mode="Markdown")
+            return
+            
+        import re
+        keyboard = []
+        for m in models:
+            display_name = m.replace("New", "").strip()
+            # Clean up for callback_data (max 64 bytes). Remove emojis, limit length.
+            safe_id = re.sub(r'[^\w\s\.\-\(\)]', '', display_name)[:40].strip()
+            keyboard.append([InlineKeyboardButton(f"{'✅ ' if current_model in display_name else ''}{display_name}", callback_data=f"model_{safe_id}")])
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(f"🤖 **Current model:** {current_model}\n\nSelect a model to switch:", reply_markup=reply_markup, parse_mode="Markdown")
+        return
+
+    status_msg = await update.message.reply_text(f"🔄 Switching model to: *{args}*...", parse_mode="Markdown")
+    
+    expr_trigger = r"""
+    (() => {
+        const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const trigger = Array.from(document.querySelectorAll('*')).find(b => {
+            const aria = normalize(b.getAttribute('aria-label') || '');
+            return aria.startsWith('select model, current:');
+        });
+        if (trigger) { trigger.click(); return true; }
+        return false;
+    })()
+    """
+    clicked = await bridge.cdp.evaluate(expr_trigger, ctx_id)
+    if not clicked:
+        await status_msg.edit_text("❌ Could not find model selector dropdown.")
+        return
+        
+    await asyncio.sleep(0.5)
+    
+    import json
+    safe_target = json.dumps(args.lower())
+    expr_target = f"""
+    (() => {{
+        const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        const items = Array.from(document.querySelectorAll('div, button')).filter(b => {{
+            if (!b.offsetParent) return false;
+            const text = normalize(b.textContent || '');
+            return text.includes({safe_target}) && !b.getAttribute('aria-label');
+        }});
+        
+        items.sort((a, b) => b.querySelectorAll('*').length - a.querySelectorAll('*').length);
+        const target = items.pop();
+        if (target) {{
+            target.click();
+            return target.textContent.trim().replace('New', '').trim();
+        }}
+        return null;
+    }})()
+    """
+    target_name = await bridge.cdp.evaluate(expr_target, ctx_id)
+    
+    if target_name:
+        await status_msg.edit_text(f"✅ Model switched to: *{target_name}*", parse_mode="Markdown")
+    else:
+        await bridge.cdp.evaluate("document.body.click()", ctx_id)
+        await status_msg.edit_text(f"❌ Model matching '{args}' not found in the dropdown.")
+
+async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not authorized(query.from_user.id):
+        return
+        
+    data = query.data
+    if not data or not data.startswith("model_"):
+        return
+    await query.answer()
+        
+    target_model = data[len("model_"):]
+    
+    if not bridge or not bridge.cdp.connected:
+        await query.edit_message_text("❌ Not connected to Antigravity.")
+        return
+        
+    ctx_id = await bridge._find_cascade_context()
+    
+    expr_trigger = r"""
+    (() => {
+        const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const trigger = Array.from(document.querySelectorAll('*')).find(b => {
+            const aria = normalize(b.getAttribute('aria-label') || '');
+            return aria.startsWith('select model, current:');
+        });
+        if (trigger) { trigger.click(); return true; }
+        return false;
+    })()
+    """
+    clicked = await bridge.cdp.evaluate(expr_trigger, ctx_id)
+    if not clicked:
+        await query.edit_message_text("❌ Could not find model selector dropdown.")
+        return
+        
+    await asyncio.sleep(0.5)
+    
+    import json
+    safe_target = json.dumps(target_model.lower())
+    expr_target = f"""
+    (() => {{
+        const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        const items = Array.from(document.querySelectorAll('div, button')).filter(b => {{
+            if (!b.offsetParent) return false;
+            const text = normalize(b.textContent || '');
+            return text.includes({safe_target}) && !b.getAttribute('aria-label');
+        }});
+        
+        items.sort((a, b) => b.querySelectorAll('*').length - a.querySelectorAll('*').length);
+        const target = items.pop();
+        if (target) {{
+            target.click();
+            return target.textContent.trim().replace('New', '').trim();
+        }}
+        return null;
+    }})()
+    """
+    target_name = await bridge.cdp.evaluate(expr_target, ctx_id)
+    
+    if target_name:
+        await query.edit_message_text(f"✅ Model switched to: *{target_name}*", parse_mode="Markdown")
+    else:
+        await bridge.cdp.evaluate("document.body.click()", ctx_id)
+        await query.edit_message_text(f"❌ Model matching '{target_model}' not found in the dropdown.")
 
 async def post_init(application):
     """Connect to CDP when the bot starts."""
@@ -1490,6 +1667,7 @@ async def post_init(application):
             BotCommand("reconnect", "Reconnect to Antigravity"),
             BotCommand("restart", "Save work & restart Antigravity"),
             BotCommand("memstat", "Check Antigravity memory usage"),
+            BotCommand("model", "View or switch current LLM model"),
             BotCommand("autoaccept", "Toggle auto-approve mode"),
         ])
         log.info("✅ Bot command menu registered")
@@ -1511,16 +1689,24 @@ def main():
     log.info("Starting Antigravity Telegram Bridge...")
     log.info(f"Allowed users: {ALLOWED_USER_IDS}")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init)
+    proxy = os.getenv("http_proxy") or os.getenv("HTTP_PROXY") or "http://127.0.0.1:7897"
+    if proxy:
+        log.info(f"Using proxy: {proxy}")
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+        
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reconnect", cmd_reconnect))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("memstat", cmd_memstat))
     app.add_handler(CommandHandler("autoaccept", cmd_autoaccept))
-    app.add_handler(CallbackQueryHandler(handle_approval_callback))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^approval_"))
+    app.add_handler(CallbackQueryHandler(handle_model_callback, pattern="^model_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 

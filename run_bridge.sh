@@ -8,6 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/bridge.log"
 CDP_PORT=9233
 
+export http_proxy="http://127.0.0.1:7897"
+export https_proxy="http://127.0.0.1:7897"
+export PYTHONUNBUFFERED=1
 exec >> "$LOG_FILE" 2>&1
 echo ""
 echo "========================================"
