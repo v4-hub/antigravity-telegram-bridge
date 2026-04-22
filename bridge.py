@@ -4,7 +4,7 @@ Telegram Bridge for Antigravity IDE
 Connects a Telegram Bot to Antigravity's chat via Chrome DevTools Protocol (CDP).
 
 Usage:
-  1. Launch Antigravity with CDP:  antigravity --remote-debugging-port=9222
+  1. Launch Antigravity with CDP:  antigravity --remote-debugging-port=9333
   2. Run this script:              python bridge.py
 
 Environment variables:
@@ -56,7 +56,7 @@ _allowed = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = set(
     int(x.strip()) for x in _allowed.split(",") if x.strip()
 )
-CDP_PORTS = [9222, 9223, 9333, 9444, 9555, 9666]
+CDP_PORTS = [9233]  # Only try 9233 as explicitly requested
 POLL_INTERVAL = 2.0        # seconds between DOM polls
 STABLE_ROUNDS = 3          # how many unchanged polls before we declare "complete"
 MAX_WAIT = 600             # max seconds to wait for a response
@@ -154,8 +154,11 @@ class CdpConnection:
                 if "workbench" in page_url or "Antigravity" in title:
                     log.info(f"Found target: \"{title}\" on port {port}")
                     try:
-                        await self._connect_ws(ws_url)
+                        # Use a short timeout so a stale WS page doesn't block discovery
+                        await asyncio.wait_for(self._connect_ws(ws_url), timeout=8)
                         return True
+                    except asyncio.TimeoutError:
+                        log.warning(f"Connection to {ws_url} timed out (stale page?), trying next target")
                     except Exception as e:
                         log.warning(f"Failed to connect to {ws_url}: {e}")
 
@@ -219,13 +222,23 @@ class CdpConnection:
             raise TimeoutError(f"CDP call {method} timed out")
 
     async def evaluate(self, expression: str, context_id: int = None) -> any:
-        """Evaluate JavaScript in the browser and return the result value."""
+        """Evaluate JavaScript in the browser and return the result value.
+        
+        Note: context_id=None means 'use default (main page) context'.
+        This is the correct behaviour for modern Antigravity where the chat UI
+        lives in the main workbench page DOM, not a separate cascade-panel frame.
+        """
         params = {"expression": expression, "returnByValue": True, "awaitPromise": True}
+        # Only add contextId if explicitly provided — omitting it uses the default context
         if context_id is not None:
             params["contextId"] = context_id
         result = await self.call("Runtime.evaluate", params)
         if result and "result" in result:
             if result["result"].get("type") == "undefined":
+                return None
+            # Handle exception info
+            if result.get("exceptionDetails"):
+                log.debug(f"JS exception: {result['exceptionDetails'].get('text')}")
                 return None
             return result["result"].get("value")
         return None
@@ -329,12 +342,18 @@ class AntigravityBridge:
     RESPONSE_SCRIPT = r"""
     (() => {
         const panel = document.querySelector('.antigravity-agent-side-panel') || document;
-        const selectors = ['.rendered-markdown', '.leading-relaxed.select-text'];
+        // Try multiple selectors in order of preference
+        const selectors = [
+            '.rendered-markdown',
+            '.leading-relaxed.select-text',
+            '[class*="rendered-markdown"]',
+            '[class*="select-text"]',
+            '.prose',
+        ];
         let lastNode = null;
         for (const sel of selectors) {
             const nodes = panel.querySelectorAll(sel);
-            if (nodes.length > 0) lastNode = nodes[nodes.length - 1];
-            if (lastNode) break;
+            if (nodes.length > 0) { lastNode = nodes[nodes.length - 1]; break; }
         }
         if (!lastNode) return '';
         // Skip if inside a <details> (thinking block)
@@ -346,14 +365,17 @@ class AntigravityBridge:
     STOP_BUTTON_SCRIPT = r"""
     (() => {
         const panel = document.querySelector('.antigravity-agent-side-panel') || document;
-        // Check for cancel/stop button
+        // Check for cancel/stop button by tooltip id
         const cancelBtn = panel.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
         if (cancelBtn) return true;
+        // Check for stop icon button (SVG stop icon)
+        const svgStopBtn = panel.querySelector('button svg[class*="stop"], button [class*="stop-icon"]');
+        if (svgStopBtn) return true;
         // Check for any button with stop-like text
         const buttons = panel.querySelectorAll('button, [role="button"]');
         for (const btn of buttons) {
             const text = (btn.textContent || '').toLowerCase().trim();
-            if (/^(stop|stop generating|stop response)$/.test(text)) return true;
+            if (/^(stop|stop generating|stop response|cancel)$/.test(text)) return true;
         }
         return false;
     })()
@@ -364,11 +386,36 @@ class AntigravityBridge:
         self._lock = asyncio.Lock()  # prevent concurrent message injection
 
     async def _find_cascade_context(self) -> Optional[int]:
-        """Find the cascade-panel execution context for DOM operations."""
+        """Find the best execution context for DOM operations.
+        
+        In modern Antigravity, the chat UI lives directly in the main workbench
+        page DOM — there is no separate cascade-panel execution context exposed
+        via CDP. Returning None here causes evaluate() to use the default
+        (main page) context, which is exactly what we want.
+        
+        We keep the cascade-panel search as an optimistic fast-path for older
+        builds that do expose it, but never force a context that can't find
+        the chat input.
+        """
+        # Fast path: historic cascade-panel context
         for ctx in self.cdp.contexts:
             if "cascade-panel" in ctx.get("url", ""):
                 return ctx["id"]
-        # Fallback: try each context
+        
+        # Modern Antigravity: chat UI is in the main page — use default context
+        # Verify the textbox is reachable without a specific contextId
+        try:
+            result = await self.cdp.evaluate(
+                f'!!document.querySelector("{self.CHAT_INPUT_SELECTOR}")',
+                None  # explicitly use default/main context
+            )
+            if result:
+                log.debug("Chat input found in default page context (modern Antigravity mode)")
+                return None  # None → evaluate uses main context
+        except Exception as e:
+            log.debug(f"Default context check failed: {e}")
+        
+        # Last resort: try each available context
         for ctx in self.cdp.contexts:
             try:
                 result = await self.cdp.evaluate(
@@ -379,6 +426,8 @@ class AntigravityBridge:
                     return ctx["id"]
             except Exception:
                 continue
+        
+        log.warning("Chat input not found in any context — returning None (will use default)")
         return None
 
     async def inject_message(self, text: str) -> bool:
@@ -501,12 +550,12 @@ class AntigravityBridge:
 
 DETECT_APPROVAL_SCRIPT = r"""
 (() => {
-    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time'];
+    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time', '允许一次', '单次允许'];
     const ALWAYS_ALLOW_PATTERNS = [
-        'allow this conversation', 'allow this chat', 'always allow',
+        'allow this conversation', 'allow this chat', 'always allow', '在此对话中允许', '总是允许',
     ];
-    const ALLOW_PATTERNS = ['allow', 'permit'];
-    const DENY_PATTERNS = ['deny', 'decline'];
+    const ALLOW_PATTERNS = ['allow', 'permit', 'approve', 'run', '允许', '运行', '批准', '同意', '执行'];
+    const DENY_PATTERNS = ['deny', 'decline', 'reject', 'cancel', '拒绝', '取消'];
 
     const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
@@ -579,9 +628,9 @@ DETECT_APPROVAL_SCRIPT = r"""
 
 EXPAND_ALWAYS_ALLOW_SCRIPT = r"""
 (() => {
-    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time'];
+    const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time', '允许一次', '单次允许'];
     const ALWAYS_ALLOW_PATTERNS = [
-        'allow this conversation', 'allow this chat', 'always allow',
+        'allow this conversation', 'allow this chat', 'always allow', '在此对话中允许', '总是允许',
     ];
     const normalize = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
     const visibleButtons = Array.from(document.querySelectorAll('button'))
@@ -819,6 +868,7 @@ class ApprovalMonitor:
             candidates = [
                 info.get("alwaysAllowText", ""),
                 "Allow This Conversation", "Allow This Chat", "Always Allow",
+                "在此对话中允许", "总是允许",
             ]
             for candidate in candidates:
                 if candidate and await self._click_button(candidate, ctx_id):
@@ -884,7 +934,7 @@ async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bridge = AntigravityBridge(cdp)
         await update.message.reply_text("✅ Reconnected to Antigravity!")
     else:
-        await update.message.reply_text("❌ Failed to connect. Is Antigravity running with --remote-debugging-port=9222?")
+        await update.message.reply_text("❌ Failed to connect. Is Antigravity natively running (the CDP port 9233 should be open)?")
 
 
 AG_SERVICE_NAME = "antigravity-cdp.service"
@@ -893,23 +943,10 @@ _restart_in_progress = False  # debounce flag for /restart
 
 
 def _get_antigravity_main_pid() -> Optional[int]:
-    """Find the main Antigravity process PID via systemd."""
+    """Find the main Antigravity process PID."""
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "show", "--property=MainPID", AG_SERVICE_NAME],
-            capture_output=True, text=True, timeout=5,
-        )
-        # Output format: MainPID=12345
-        for line in result.stdout.strip().split("\n"):
-            if line.startswith("MainPID="):
-                pid = int(line.split("=", 1)[1])
-                return pid if pid > 0 else None
-    except Exception:
-        pass
-    # Fallback to pgrep
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "antigravity.*--user-data-dir"],
+            ["pgrep", "-f", "antigravity.*--remote-debugging-port"],
             capture_output=True, text=True, timeout=5,
         )
         pids = result.stdout.strip().split("\n")
@@ -919,18 +956,8 @@ def _get_antigravity_main_pid() -> Optional[int]:
 
 
 def _get_service_active_state() -> str:
-    """Get the ActiveState of the antigravity-cdp systemd service."""
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "show", "--property=ActiveState", AG_SERVICE_NAME],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            if line.startswith("ActiveState="):
-                return line.split("=", 1)[1]
-    except Exception:
-        pass
-    return "unknown"
+    """Check if Antigravity is running."""
+    return "active" if _get_antigravity_main_pid() else "unknown"
 
 
 def _kill_orphaned_antigravity_in_bridge_cgroup():
@@ -1043,41 +1070,37 @@ async def _do_restart(update: Update):
 
     await status_msg.edit_text(
         f"🔄 *Restarting Antigravity...*\n\n"
-        f"1️⃣ Service state: `{state}` (PID {old_pid or 'N/A'})\n"
-        f"2️⃣ Restarting via systemd (hot-exit → relaunch)...",
+        f"1️⃣ Status: `{state}` (PID {old_pid or 'N/A'})\n"
+        f"2️⃣ Restarting via macOS process... (hot-exit → relaunch)",
         parse_mode="Markdown",
     )
 
-    # 3. Delegate the full restart to systemd
-    #    systemd will: SIGTERM → wait → SIGKILL if needed → relaunch
+    # 3. Kill and Relaunch
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "systemctl", "--user", "restart", AG_SERVICE_NAME,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        if old_pid:
+            os.kill(old_pid, signal.SIGTERM)
+            await asyncio.sleep(2)
+            try:
+                os.kill(old_pid, 0) # check if still alive
+                os.kill(old_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        
+        # Relaunch using nohup
+        # Assuming antigravity is in PATH. If not, consider providing a full path.
+        subprocess.Popen(
+            "nohup antigravity --remote-debugging-port=9333 > /dev/null 2>&1 &",
+            shell=True,
+            start_new_session=True
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=AG_RESTART_TIMEOUT)
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip() or stdout.decode().strip()
-            await status_msg.edit_text(
-                f"❌ systemd restart failed (rc={proc.returncode}):\n`{err_msg}`",
-                parse_mode="Markdown",
-            )
-            return
-    except asyncio.TimeoutError:
-        await status_msg.edit_text(
-            f"⚠️ systemd restart timed out after {AG_RESTART_TIMEOUT}s.\n"
-            "Try `/reconnect` once Antigravity finishes loading.",
-            parse_mode="Markdown",
-        )
-        return
+        await asyncio.sleep(3) # Give it a moment to start
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to restart service: `{e}`", parse_mode="Markdown")
         return
 
     await status_msg.edit_text(
         "🔄 *Restarting Antigravity...*\n\n"
-        "1️⃣ Service restarted ✅\n"
+        "1️⃣ Process restarted ✅\n"
         "2️⃣ Work saved (hot-exit) ✅\n"
         "3️⃣ Waiting for startup (reconnecting CDP)...",
         parse_mode="Markdown",
@@ -1209,7 +1232,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("🔄 Connecting to Antigravity...")
         ok = await cdp.discover_and_connect()
         if not ok:
-            await status_msg.edit_text("❌ Cannot connect to Antigravity.\nMake sure it's running with `--remote-debugging-port=9222`")
+            await status_msg.edit_text("❌ Cannot connect to Antigravity.\nMake sure it's running with `--remote-debugging-port=9333`")
             return
         bridge = AntigravityBridge(cdp)
         await status_msg.edit_text("✅ Connected!")
@@ -1340,7 +1363,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cdp.connected:
             ok = await cdp.discover_and_connect()
             if not ok:
-                await status_msg.edit_text("❌ Cannot connect to Antigravity.\nMake sure it's running with `--remote-debugging-port=9222`")
+                await status_msg.edit_text("❌ Cannot connect to Antigravity.\nMake sure it's running with `--remote-debugging-port=9333`")
                 return
             bridge = AntigravityBridge(cdp)
             await status_msg.edit_text(f"🎤 *Transcribed:* _{user_text}_\n\n✅ Connected!", parse_mode="Markdown")

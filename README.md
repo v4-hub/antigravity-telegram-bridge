@@ -11,7 +11,8 @@ Phone (Telegram) → Bot → bridge.py → CDP WebSocket → Antigravity Chat
 
 - **Text Messages** → forwarded to Antigravity, AI response sent back
 - **Voice Messages** → local Whisper transcription → forwarded to Antigravity
-- **Auto-connect** → discovers and connects to Antigravity automatically
+- **Smart Launcher** → actively monitors the IDE and injects the CDP port automatically if missing
+- **Interactive Approvals** → native support for English/Chinese inline buttons (Allow/Run/允许/运行) directly in Telegram
 - **Progress streaming** → shows live thinking status in Telegram
 - **Long response splitting** → handles multi-message AI responses
 
@@ -51,19 +52,20 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USER_IDS=your_user_id_here
 ```
 
-### 4. Launch Antigravity with CDP
+### 4. Setup Background Service (Recommended)
 
-Start Antigravity with the Chrome DevTools Protocol port enabled:
+To ensure the bridge and IDE are always connected, use the smart launcher:
 
+**For macOS (One-click):**
 ```bash
-antigravity --remote-debugging-port=9222
+bash install_mac_service.sh
 ```
 
-### 5. Start the Bridge
-
+**For Linux / Manual Start:**
 ```bash
-bash start.sh
+bash run_bridge.sh
 ```
+*(Note: `run_bridge.sh` will automatically open Antigravity with the correct `--remote-debugging-port=9233` flag)*
 
 ## 📱 Usage
 
@@ -71,15 +73,28 @@ bash start.sh
 |--------|-------------|
 | Send text message | Forwarded to Antigravity AI |
 | Send voice message | Transcribed locally → forwarded |
+| Click Inline Buttons | Proxies clicks to IDE approval dialogs (e.g., Run/Allow/运行) |
 | `/status` | Check CDP connection status |
 | `/reconnect` | Reconnect to Antigravity |
 | `/start` or `/help` | Show help |
+
+## 🕳️ Troubleshooting & Pitfalls Avoided
+
+- **Pitfall 1: Clicking the Dock Icon breaks the connection**
+  *Issue:* Normal launches (via Launchpad/Dock) don't include the `--remote-debugging-port` flag, leaving the bot disconnected.
+  *Solution:* The new `run_bridge.sh` acts as an active monitor. If it detects the IDE running without the port, it gracefully restarts it and injects the port automatically.
+- **Pitfall 2: Cannot click "Allow" / "Run" via Telegram**
+  *Issue:* Previous versions only recognized English buttons ("Allow", "Deny").
+  *Solution:* We've added comprehensive regex patterns for Chinese environments (`允许`, `运行`, `始终允许`, `拒绝`). Inline Telegram buttons will seamlessly proxy your clicks to the IDE.
+- **Pitfall 3: Background memory leaks from orphaned processes**
+  *Issue:* Restarting the bridge sometimes orphaned IDE renderer processes.
+  *Solution:* `bridge.py` now includes a cgroup-based cleanup mechanism that kills ghost instances before reconnecting.
 
 ## 🏗️ How It Works
 
 The bridge connects to Antigravity's Electron window via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) (CDP):
 
-1. **Discovery** — Scans ports 9222-9666 for the Antigravity workbench page
+1. **Discovery** — Connects to port 9233 for the Antigravity workbench page
 2. **Injection** — Focuses the chat input (`div[role="textbox"]`), types the message via `Input.insertText`, presses Enter
 3. **Monitoring** — Polls the DOM for `.rendered-markdown` content every 2 seconds
 4. **Completion** — Detects when the stop button disappears and text stabilizes
@@ -104,7 +119,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/opt/antigravity/antigravity --user-data-dir=%h/.config/Antigravity-CDP --remote-debugging-port=9222
+ExecStart=/opt/antigravity/antigravity --user-data-dir=%h/.config/Antigravity-CDP --remote-debugging-port=9233
 Restart=always
 RestartSec=10
 # Adjust these to match your display environment (run `echo $DISPLAY` to check)
